@@ -298,7 +298,7 @@ export class WavRecorder {
    * @param {string} [deviceId] if no device provided, default device will be used
    * @returns {Promise<true>}
    */
-  async begin(deviceId) {
+  async begin(deviceId: string | undefined): Promise<true> {
     if (this.processor) {
       throw new Error(
         `Already connected: please call .end() to start a new session`,

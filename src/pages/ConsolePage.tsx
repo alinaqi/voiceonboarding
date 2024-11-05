@@ -26,6 +26,8 @@ import { Map } from '../components/Map';
 
 import './ConsolePage.scss';
 import { isJsxOpeningLikeElement } from 'typescript';
+import { getMeetingsForToday } from '../utils/meetings';
+import { getPersonDetails } from '../utils/people';
 
 /**
  * Type for result from get_weather() function call
@@ -124,6 +126,11 @@ export function ConsolePage() {
     lng: -122.418137,
   });
   const [marker, setMarker] = useState<Coordinates | null>(null);
+  const ws = useRef<WebSocket | null>(null); // Specify the type of ws.current
+
+  // Add a state to hold the list of audio devices
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
 
   /**
    * Utility for formatting the timing of logs
@@ -174,7 +181,7 @@ export function ConsolePage() {
     setItems(client.conversation.getItems());
 
     // Connect to microphone
-    await wavRecorder.begin();
+    await wavRecorder.begin(selectedDeviceId || undefined); // Use undefined if selectedDeviceId is null
 
     // Connect to audio output
     await wavStreamPlayer.connect();
@@ -192,7 +199,7 @@ export function ConsolePage() {
     if (client.getTurnDetectionType() === 'server_vad') {
       await wavRecorder.record((data) => client.appendInputAudio(data.mono));
     }
-  }, []);
+  }, [selectedDeviceId]);
 
   /**
    * Disconnect and reset conversation state
@@ -222,6 +229,75 @@ export function ConsolePage() {
     const client = clientRef.current;
     client.deleteItem(id);
   }, []);
+
+  const startScreenRecording = async () => {
+    try {
+        const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+        const videoElement = document.createElement('video');
+        videoElement.srcObject = stream;
+        videoElement.play();
+
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d');
+
+        const captureInterval = setInterval(async () => {
+            if (context) { // Check if context is not null
+                context.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+                const imageData = canvas.toDataURL('image/png');
+                const description = await sendImageToOpenAI(imageData); // Get description from OpenAI
+                playBackDescription(description); // Play back the description
+            }
+        }, 5000); // Capture every 5 seconds
+
+        stream.getVideoTracks()[0].addEventListener('ended', () => {
+            clearInterval(captureInterval);
+            console.log('Screen sharing stopped.');
+        });
+    } catch (error) {
+        console.error('Error starting screen recording:', error);
+    }
+};
+
+// Function to send captured images to OpenAI API and get description
+const sendImageToOpenAI = async (imageData: string): Promise<string> => {
+  console.log('Sending image to OpenAI:', imageData);
+  if (ws.current && ws.current.readyState === WebSocket.OPEN) { // Check if ws.current is not null and is open
+      const event = {
+          type: 'conversation.item.create',
+          item: {
+              type: 'message',
+              role: 'user',
+              content: [{
+                  type: 'input_image',
+                  image: imageData, // Base64 encoded image
+              }]
+          }
+      };
+      ws.current.send(JSON.stringify(event)); // Send the image
+
+      // Wait for the response from OpenAI
+      return new Promise((resolve) => {
+        if (ws.current) { // Check if ws.current is not null
+          ws.current.onmessage = (message) => {
+              const response = JSON.parse(message.data);
+            if (response.type === 'conversation.item.create' && response.item) {
+                const description = response.item.formatted.text; // Assuming the description is in formatted.text
+                resolve(description);
+            }
+          };
+        }
+      });
+  } else {
+      console.error('WebSocket is not connected.'); // Log the error
+      return ''; // Return an empty string or handle the error as needed
+  }
+};
+
+// Function to play back the description
+const playBackDescription = (description: string) => {
+    const utterance = new SpeechSynthesisUtterance(description);
+    window.speechSynthesis.speak(utterance);
+};
 
   /**
    * In push-to-talk mode, start recording
@@ -411,6 +487,7 @@ export function ConsolePage() {
         return { ok: true };
       }
     );
+
     client.addTool(
       {
         name: 'get_weather',
@@ -452,6 +529,61 @@ export function ConsolePage() {
         };
         setMarker({ lat, lng, location, temperature, wind_speed });
         return json;
+      }
+    );
+
+    // Add tool to retrieve meetings for today
+    client.addTool(
+      {
+        name: 'retrieve_meetings',
+        description: 'Retrieves meetings for today.',
+        parameters: {
+          type: 'object',
+          properties: {},
+          required: [],
+        },
+      },
+      async () => {
+        const meetings = getMeetingsForToday(); // Call the function from meetings.ts
+        return { meetings };
+      }
+    );
+
+    // Add tool to retrieve information about people
+    client.addTool(
+      {
+        name: 'retrieve_person_info',
+        description: 'Retrieves information about a person.',
+        parameters: {
+          type: 'object',
+          properties: {
+            name: {
+              type: 'string',
+              description: 'Name of the person to retrieve information about.',
+            },
+          },
+          required: ['name'],
+        },
+      },
+      async ({ name }: { name: string }) => {
+        const personInfo = getPersonDetails(name); // Call the function from people.ts
+        return { personInfo };
+      }
+    );
+
+    // Add tool to record and describe the screen
+    client.addTool(
+      {
+        name: 'record_and_describe_screen',
+        description: 'Records the screen and describes the images captured.',
+        parameters: {
+          type: 'object',
+          properties: {},
+          required: [],
+        },
+      },
+      async () => {
+        await startScreenRecording();
       }
     );
 
@@ -501,15 +633,55 @@ export function ConsolePage() {
   }, []);
 
   /**
+   * Function to list audio devices
+   */
+  const listAudioDevices = async () => {
+    const devices = await wavRecorderRef.current.listDevices();
+    setAudioDevices(devices);
+  };
+
+  /**
+   * Call this function when the component mounts
+   */
+  useEffect(() => {
+    listAudioDevices();
+  }, []);
+
+  /**
+   * Inside the ConsolePage component
+   */
+  const handleUserQuery = (query: string) => {
+    // Normalize the query to lower case for easier matching
+    const normalizedQuery = query.toLowerCase();
+
+    if (normalizedQuery.includes("meetings today") || normalizedQuery.includes("how many meetings do I have today")) {
+      const response = getMeetingsForToday();
+      sendResponseToUser(response);
+    } else if (normalizedQuery.includes("tell me more about kevin")) {
+      const response = getPersonDetails("Kevin");
+      sendResponseToUser(response);
+    } else {
+      sendResponseToUser("I'm not sure how to respond to that.");
+    }
+  };
+
+  // Example function to send response back to the user
+  const sendResponseToUser = (response: string) => {
+    // Logic to send the response to the UI or audio output
+    console.log(response); // Replace with actual implementation
+  };
+
+  /**
    * Render the application
    */
   return (
     <div data-component="ConsolePage">
       <div className="content-top">
         <div className="content-title">
-          <img src="/openai-logomark.svg" />
-          <span>realtime console</span>
+          <img src="/workhub-logo.png" alt="WorkHub AI Logo" /> {/* Updated logo source */}
+          <span>WorkHub AI</span>
         </div>
+        <Button onClick={connectConversation}>Connect</Button>
         <div className="content-api-key">
           {!LOCAL_RELAY_SERVER_URL && (
             <Button
@@ -663,6 +835,19 @@ export function ConsolePage() {
             </div>
           </div>
           <div className="content-actions">
+            <label htmlFor="audio-device-select">Select Audio Device:</label>
+            <select
+              id="audio-device-select"
+              value={selectedDeviceId || ''}
+              onChange={(e) => setSelectedDeviceId(e.target.value)}
+            >
+              <option value="" disabled>Select an audio device</option>
+              {audioDevices.map((device) => (
+                <option key={device.deviceId} value={device.deviceId}>
+                  {device.label}
+                </option>
+              ))}
+            </select>
             <Toggle
               defaultValue={false}
               labels={['manual', 'vad']}
@@ -689,40 +874,6 @@ export function ConsolePage() {
                 isConnected ? disconnectConversation : connectConversation
               }
             />
-          </div>
-        </div>
-        <div className="content-right">
-          <div className="content-block map">
-            <div className="content-block-title">get_weather()</div>
-            <div className="content-block-title bottom">
-              {marker?.location || 'not yet retrieved'}
-              {!!marker?.temperature && (
-                <>
-                  <br />
-                  🌡️ {marker.temperature.value} {marker.temperature.units}
-                </>
-              )}
-              {!!marker?.wind_speed && (
-                <>
-                  {' '}
-                  🍃 {marker.wind_speed.value} {marker.wind_speed.units}
-                </>
-              )}
-            </div>
-            <div className="content-block-body full">
-              {coords && (
-                <Map
-                  center={[coords.lat, coords.lng]}
-                  location={coords.location}
-                />
-              )}
-            </div>
-          </div>
-          <div className="content-block kv">
-            <div className="content-block-title">set_memory()</div>
-            <div className="content-block-body content-kv">
-              {JSON.stringify(memoryKv, null, 2)}
-            </div>
           </div>
         </div>
       </div>
